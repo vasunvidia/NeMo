@@ -817,6 +817,14 @@ class AutocastTransformerLayer(TransformerLayer):
         ub_tp_comm_overlap: bool = False,
         autocast_dtype: Any = 16,
         zero_centered_gamma: bool = False,
+        fp8=False,
+        fp8_e4m3=False,
+        fp8_hybrid=False,
+        fp8_margin=0,
+        fp8_interval=1,
+        fp8_amax_history_len=1,
+        fp8_amax_compute_algo='most_recent',
+        reduce_amax=True,
     ) -> None:
         super().__init__(
             hidden_size=hidden_size,
@@ -849,6 +857,30 @@ class AutocastTransformerLayer(TransformerLayer):
             zero_centered_gamma=zero_centered_gamma,
             ub_tp_comm_overlap=ub_tp_comm_overlap,
         )
+        self.fp8 = fp8
+        self.fp8_e4m3 = fp8_e4m3
+        self.fp8_hybrid = fp8_hybrid
+        self.fp8_margin = fp8_margin
+        self.fp8_interval = fp8_interval
+        self.fp8_amax_history_len = fp8_amax_history_len
+        self.fp8_amax_compute_algo = fp8_amax_compute_algo
+        self.reduce_amax = reduce_amax
+
+        self.fp8_recipe = None
+
+        if self.fp8:
+            if self.fp8_e4m3:
+                fp8_format = recipe.Format.E4M3
+            elif self.fp8_hybrid:
+                fp8_format = recipe.Format.HYBRID
+            self.fp8_recipe = recipe.DelayedScaling(
+                margin=self.fp8_margin,
+                interval=self.fp8_interval,
+                fp8_format=fp8_format,
+                amax_history_len=self.fp8_amax_history_len,
+                amax_compute_algo=self.fp8_amax_compute_algo,
+                reduce_amax=reduce_amax,
+            )
         # use_emha=use_emha,
 
         # Dtype for forward pass - ignore amp O2
@@ -857,33 +889,45 @@ class AutocastTransformerLayer(TransformerLayer):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor,
+        attention_mask: torch.Tensor = None,
         encoder_output: Optional[torch.Tensor] = None,
         enc_dec_attn_mask: Optional[torch.Tensor] = None,
         inference_params: Optional[Any] = None,
         is_first_microbatch: Optional[bool] = None,
         checkpoint_core_attention: Optional[bool] = False,
     ) -> torch.Tensor:
-        if self.dtype == torch.float32:
-            return super().forward(
-                hidden_states,
-                attention_mask,
-                encoder_output=encoder_output,
-                enc_dec_attn_mask=enc_dec_attn_mask,
-                inference_params=inference_params,
-                is_first_microbatch=is_first_microbatch,
-                checkpoint_core_attention=checkpoint_core_attention,
-            )
-        with torch.autocast(device_type="cuda", dtype=self.dtype):
-            return super().forward(
-                hidden_states,
-                attention_mask,
-                encoder_output=encoder_output,
-                enc_dec_attn_mask=enc_dec_attn_mask,
-                inference_params=inference_params,
-                is_first_microbatch=is_first_microbatch,
-                checkpoint_core_attention=checkpoint_core_attention,
-            )
+        # fp8_autocast will not do anything if TE or FP8 isn't used
+        fp8_group = None
+        if self.fp8 and parallel_state.model_parallel_is_initialized():
+            fp8_group = parallel_state.get_amax_reduction_group()
+
+        if HAVE_TE:
+            # if TE is installed but fp8 is not available then this will do nothing
+            fp8_context = fp8_autocast(enabled=self.fp8, fp8_recipe=self.fp8_recipe, fp8_group=fp8_group)
+
+        else:
+            fp8_context = nullcontext()
+        with fp8_context:
+            if self.dtype == torch.float32:
+                return super().forward(
+                    hidden_states,
+                    attention_mask,
+                    encoder_output=encoder_output,
+                    enc_dec_attn_mask=enc_dec_attn_mask,
+                    inference_params=inference_params,
+                    is_first_microbatch=is_first_microbatch,
+                    checkpoint_core_attention=checkpoint_core_attention,
+                )
+            with torch.autocast(device_type="cuda", dtype=self.dtype):
+                return super().forward(
+                    hidden_states,
+                    attention_mask,
+                    encoder_output=encoder_output,
+                    enc_dec_attn_mask=enc_dec_attn_mask,
+                    inference_params=inference_params,
+                    is_first_microbatch=is_first_microbatch,
+                    checkpoint_core_attention=checkpoint_core_attention,
+                )
 
 
 class ParallelTransformer(MegatronModule):
@@ -1059,6 +1103,8 @@ class ParallelTransformer(MegatronModule):
         # TODO: Add similar assert for encoder-decoder.
 
         self.num_layers = self.get_num_layers(num_layers)
+        self.capture_graph = False
+        self.graph_captured = False
         # Transformer layers.
         def build_layer(layer_number):
             if isinstance(layer_type, list):
@@ -1174,6 +1220,7 @@ class ParallelTransformer(MegatronModule):
                 offset = parallel_state.get_pipeline_model_parallel_rank() * self.num_layers
 
         self.layers = torch.nn.ModuleList([build_layer(i + 1 + offset) for i in range(self.num_layers)])
+        self.layers_cg = torch.nn.ModuleList()
 
         if self.post_process and self.transformer_block_type != 'post_ln':
             # Final layer norm before output.
@@ -1470,110 +1517,121 @@ class ParallelTransformer(MegatronModule):
         else:
             rng_context = nullcontext()
 
-        with rng_context:
-            # fp8_autocast will not do anything if TE or FP8 isn't used
-            fp8_group = None
-            if self.fp8 and parallel_state.model_parallel_is_initialized():
-                fp8_group = parallel_state.get_amax_reduction_group()
+        #with rng_context:
+        # fp8_autocast will not do anything if TE or FP8 isn't used
+        fp8_group = None
+        if self.fp8 and parallel_state.model_parallel_is_initialized():
+            fp8_group = parallel_state.get_amax_reduction_group()
 
-            if HAVE_TE:
-                # if TE is installed but fp8 is not available then this will do nothing
-                fp8_context = fp8_autocast(enabled=self.fp8, fp8_recipe=self.fp8_recipe, fp8_group=fp8_group)
+        if HAVE_TE:
+            # if TE is installed but fp8 is not available then this will do nothing
+            fp8_context = fp8_autocast(enabled=self.fp8, fp8_recipe=self.fp8_recipe, fp8_group=fp8_group)
 
-            else:
-                fp8_context = nullcontext()
+        else:
+            fp8_context = nullcontext()
 
-            with fp8_context:
-                if self.activations_checkpoint_granularity == 'full' and self.activations_checkpoint_num_layers > 0:
-                    hidden_states = self._checkpointed_forward(
+        #with fp8_context:
+        if self.activations_checkpoint_granularity == 'full' and self.activations_checkpoint_num_layers > 0:
+            hidden_states = self._checkpointed_forward(
+                hidden_states,
+                attention_mask,
+                encoder_output,
+                enc_dec_attn_mask,
+                rotary_pos_emb,
+                self_attention_relative_position_bias,
+                cross_attention_relative_position_bias,
+                checkpoint_activations_all_layers,
+            )
+        else:
+            if get_key_value:
+                presents = []
+
+            if self.transformer_engine:
+                # Pass key value information to TE through inference_params to pre-allocate memory
+                if set_inference_key_value_memory:
+                    self.inference_params = type('', (), {})()
+                    self.inference_params.max_sequence_len = inference_max_sequence_len
+                    self.inference_params.max_batch_size = hidden_states.size(1)
+                    self.inference_params.batch_size_offset = 0
+                    self.inference_params.key_value_memory_dict = {}
+                    self.inference_params.sequence_len_offset = 0
+                    self.inference_current_sequence_len = 0
+
+                if self.inference_params != None:
+                    self.inference_params.sequence_len_offset = self.inference_current_sequence_len
+
+            for index in range(self.num_layers):
+                layer = self._get_layer(index)
+                past = None
+
+                if layer_past is not None:
+                    past = layer_past[index]
+
+                if self.activations_checkpoint_granularity == 'selective':
+                    # When pipeline-parallel size > 1 and 'num_micro_batches_with_partial_activation_checkpoints' = int,
+                    # pipeline scheduling can force to checkpoint all layers or partial layers in a micro-batch.
+                    if (
+                        checkpoint_activations_all_layers == True
+                        or self.activations_checkpoint_method == 'uniform'
+                    ):
+                        checkpoint_core_attention = True
+                    elif self.activations_checkpoint_method == 'block':
+                        activations_checkpoint_num_layers = self.activations_checkpoint_num_layers
+                        # Decrease the number of layers to checkpoint at later pipeline stages
+                        if self.activations_checkpoint_layers_per_pipeline is not None:
+                            activations_checkpoint_num_layers -= int(
+                                parallel_state.get_pipeline_model_parallel_rank()
+                                * self.activations_checkpoint_layers_per_pipeline
+                            )
+                        checkpoint_core_attention = index < activations_checkpoint_num_layers
+                else:
+                    checkpoint_core_attention = False
+
+                # Cache FP8 weight and transpose at (1) the first micro-batch in each global-batch
+                # in training, (2) the first micro-batch in each validation and test routine.
+                # The caching happens in TransformerEngine when passing `is_first_microbatch=True`.
+                is_first_microbatch = (self.is_first_train_microbatch and self.training) or (
+                    self.is_prev_microbatch_training and not self.training
+                )
+                if self.transformer_engine:
+                    if (attention_mask is None) and \
+                       (encoder_output is None) and \
+                       (enc_dec_attn_mask is None) and \
+                       (self.inference_params is None) and \
+                       (not is_first_microbatch) and \
+                       (not checkpoint_core_attention) and \
+                       self.graph_captured:
+                       hidden_states = self.layers_cg[index](hidden_states)
+                    else:
+                        hidden_states = layer(
+                            hidden_states,
+                            attention_mask,
+                            encoder_output=encoder_output,
+                            enc_dec_attn_mask=enc_dec_attn_mask,
+                            inference_params=self.inference_params,
+                            is_first_microbatch=is_first_microbatch,
+                            checkpoint_core_attention=checkpoint_core_attention,
+                        )
+                else:
+                    hidden_states = layer(
                         hidden_states,
                         attention_mask,
-                        encoder_output,
-                        enc_dec_attn_mask,
-                        rotary_pos_emb,
-                        self_attention_relative_position_bias,
-                        cross_attention_relative_position_bias,
-                        checkpoint_activations_all_layers,
+                        encoder_output=encoder_output,
+                        enc_dec_attn_mask=enc_dec_attn_mask,
+                        layer_past=past,
+                        get_key_value=get_key_value,
+                        set_inference_key_value_memory=set_inference_key_value_memory,
+                        inference_max_sequence_len=inference_max_sequence_len,
+                        rotary_pos_emb=rotary_pos_emb,
+                        self_attention_relative_position_bias=self_attention_relative_position_bias,
+                        cross_attention_relative_position_bias=cross_attention_relative_position_bias,
+                        checkpoint_core_attention=checkpoint_core_attention,
                     )
-                else:
-                    if get_key_value:
-                        presents = []
-
-                    if self.transformer_engine:
-                        # Pass key value information to TE through inference_params to pre-allocate memory
-                        if set_inference_key_value_memory:
-                            self.inference_params = type('', (), {})()
-                            self.inference_params.max_sequence_len = inference_max_sequence_len
-                            self.inference_params.max_batch_size = hidden_states.size(1)
-                            self.inference_params.batch_size_offset = 0
-                            self.inference_params.key_value_memory_dict = {}
-                            self.inference_params.sequence_len_offset = 0
-                            self.inference_current_sequence_len = 0
-
-                        if self.inference_params != None:
-                            self.inference_params.sequence_len_offset = self.inference_current_sequence_len
-
-                    for index in range(self.num_layers):
-                        layer = self._get_layer(index)
-                        past = None
-
-                        if layer_past is not None:
-                            past = layer_past[index]
-
-                        if self.activations_checkpoint_granularity == 'selective':
-                            # When pipeline-parallel size > 1 and 'num_micro_batches_with_partial_activation_checkpoints' = int,
-                            # pipeline scheduling can force to checkpoint all layers or partial layers in a micro-batch.
-                            if (
-                                checkpoint_activations_all_layers == True
-                                or self.activations_checkpoint_method == 'uniform'
-                            ):
-                                checkpoint_core_attention = True
-                            elif self.activations_checkpoint_method == 'block':
-                                activations_checkpoint_num_layers = self.activations_checkpoint_num_layers
-                                # Decrease the number of layers to checkpoint at later pipeline stages
-                                if self.activations_checkpoint_layers_per_pipeline is not None:
-                                    activations_checkpoint_num_layers -= int(
-                                        parallel_state.get_pipeline_model_parallel_rank()
-                                        * self.activations_checkpoint_layers_per_pipeline
-                                    )
-                                checkpoint_core_attention = index < activations_checkpoint_num_layers
-                        else:
-                            checkpoint_core_attention = False
-
-                        # Cache FP8 weight and transpose at (1) the first micro-batch in each global-batch
-                        # in training, (2) the first micro-batch in each validation and test routine.
-                        # The caching happens in TransformerEngine when passing `is_first_microbatch=True`.
-                        is_first_microbatch = (self.is_first_train_microbatch and self.training) or (
-                            self.is_prev_microbatch_training and not self.training
-                        )
-                        if self.transformer_engine:
-                            hidden_states = layer(
-                                hidden_states,
-                                attention_mask,
-                                encoder_output=encoder_output,
-                                enc_dec_attn_mask=enc_dec_attn_mask,
-                                inference_params=self.inference_params,
-                                is_first_microbatch=is_first_microbatch,
-                                checkpoint_core_attention=checkpoint_core_attention,
-                            )
-                        else:
-                            hidden_states = layer(
-                                hidden_states,
-                                attention_mask,
-                                encoder_output=encoder_output,
-                                enc_dec_attn_mask=enc_dec_attn_mask,
-                                layer_past=past,
-                                get_key_value=get_key_value,
-                                set_inference_key_value_memory=set_inference_key_value_memory,
-                                inference_max_sequence_len=inference_max_sequence_len,
-                                rotary_pos_emb=rotary_pos_emb,
-                                self_attention_relative_position_bias=self_attention_relative_position_bias,
-                                cross_attention_relative_position_bias=cross_attention_relative_position_bias,
-                                checkpoint_core_attention=checkpoint_core_attention,
-                            )
-                    # Update current sequence length outside of the loops
-                    if self.transformer_engine:
-                        self.inference_current_sequence_len += hidden_states.size(0)
+            # Update current sequence length outside of the loops
+            if self.transformer_engine:
+                #if self.capture_graph and not self.graph_captured:
+                #    self.graph_captured = True
+                self.inference_current_sequence_len += hidden_states.size(0)
 
         # Skip counter update for eval and activation checkpointing
         if torch.is_grad_enabled() and self.training:
