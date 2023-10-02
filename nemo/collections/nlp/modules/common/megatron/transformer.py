@@ -813,6 +813,14 @@ class AutocastTransformerLayer(TransformerLayer):
         output_layernorm: bool = False,
         layer_type: str = "encoder",
         drop_path_rate: float = 0,
+        fp8=False,
+        fp8_e4m3=False,
+        fp8_hybrid=False,
+        fp8_margin=0,
+        fp8_interval=1,
+        fp8_amax_history_len=1,
+        fp8_amax_compute_algo='most_recent',
+        reduce_amax=True,
         use_emha: bool = False,
         ub_tp_comm_overlap: bool = False,
         autocast_dtype: Any = 16,
@@ -853,37 +861,74 @@ class AutocastTransformerLayer(TransformerLayer):
 
         # Dtype for forward pass - ignore amp O2
         self.dtype = utils_funcs.dtype_from_precision(autocast_dtype, megatron_amp_O2=None)
+        self.fp8 = fp8
+        self.fp8_e4m3 = fp8_e4m3
+        self.fp8_hybrid = fp8_hybrid
+        self.fp8_margin = fp8_margin
+        self.fp8_interval = fp8_interval
+        self.fp8_amax_history_len = fp8_amax_history_len
+        self.fp8_amax_compute_algo = fp8_amax_compute_algo
+        self.reduce_amax = reduce_amax
+
+        self.fp8_recipe = None
+
+        if self.fp8:
+            if self.fp8_e4m3:
+                fp8_format = recipe.Format.E4M3
+            elif self.fp8_hybrid:
+                fp8_format = recipe.Format.HYBRID
+            self.fp8_recipe = recipe.DelayedScaling(
+                margin=self.fp8_margin,
+                interval=self.fp8_interval,
+                fp8_format=fp8_format,
+                amax_history_len=self.fp8_amax_history_len,
+                amax_compute_algo=self.fp8_amax_compute_algo,
+                reduce_amax=reduce_amax,
+            )
+
 
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
         encoder_output: Optional[torch.Tensor] = None,
         enc_dec_attn_mask: Optional[torch.Tensor] = None,
         inference_params: Optional[Any] = None,
         is_first_microbatch: Optional[bool] = None,
         checkpoint_core_attention: Optional[bool] = False,
     ) -> torch.Tensor:
-        if self.dtype == torch.float32:
-            return super().forward(
-                hidden_states,
-                attention_mask,
-                encoder_output=encoder_output,
-                enc_dec_attn_mask=enc_dec_attn_mask,
-                inference_params=inference_params,
-                is_first_microbatch=is_first_microbatch,
-                checkpoint_core_attention=checkpoint_core_attention,
-            )
-        with torch.autocast(device_type="cuda", dtype=self.dtype):
-            return super().forward(
-                hidden_states,
-                attention_mask,
-                encoder_output=encoder_output,
-                enc_dec_attn_mask=enc_dec_attn_mask,
-                inference_params=inference_params,
-                is_first_microbatch=is_first_microbatch,
-                checkpoint_core_attention=checkpoint_core_attention,
-            )
+        # fp8_autocast will not do anything if TE or FP8 isn't used
+        fp8_group = None
+        if self.fp8 and parallel_state.model_parallel_is_initialized():
+            fp8_group = parallel_state.get_amax_reduction_group()
+
+        if HAVE_TE:
+            # if TE is installed but fp8 is not available then this will do nothing
+            fp8_context = fp8_autocast(enabled=self.fp8, fp8_recipe=self.fp8_recipe, fp8_group=fp8_group)
+        else:
+            fp8_context = nullcontext()
+
+        with fp8_context:
+            if self.dtype == torch.float32:
+                return super().forward(
+                    hidden_states,
+                    attention_mask,
+                    encoder_output=encoder_output,
+                    enc_dec_attn_mask=enc_dec_attn_mask,
+                    inference_params=inference_params,
+                    is_first_microbatch=is_first_microbatch,
+                    checkpoint_core_attention=checkpoint_core_attention,
+                )
+            with torch.autocast(device_type="cuda", dtype=self.dtype):
+                return super().forward(
+                    hidden_states,
+                    attention_mask,
+                    encoder_output=encoder_output,
+                    enc_dec_attn_mask=enc_dec_attn_mask,
+                    inference_params=inference_params,
+                    is_first_microbatch=is_first_microbatch,
+                    checkpoint_core_attention=checkpoint_core_attention,
+                )
 
 
 class ParallelTransformer(MegatronModule):
@@ -1089,6 +1134,14 @@ class ParallelTransformer(MegatronModule):
                     sequence_parallel=sequence_parallel,
                     apply_residual_connection_post_layernorm=False,
                     autocast_dtype=precision,
+                    fp8=fp8,
+                    fp8_e4m3=fp8_e4m3,
+                    fp8_hybrid=fp8_hybrid,
+                    fp8_margin=fp8_margin,
+                    fp8_interval=fp8_interval,
+                    fp8_amax_history_len=fp8_amax_history_len,
+                    fp8_amax_compute_algo=fp8_amax_compute_algo,
+                    reduce_amax=reduce_amax,
                     use_emha=use_emha,
                     ub_tp_comm_overlap=ub_tp_comm_overlap,
                     zero_centered_gamma=normalization == 'layernorm1p',
@@ -1479,6 +1532,7 @@ class ParallelTransformer(MegatronModule):
             if HAVE_TE:
                 # if TE is installed but fp8 is not available then this will do nothing
                 fp8_context = fp8_autocast(enabled=self.fp8, fp8_recipe=self.fp8_recipe, fp8_group=fp8_group)
+                fp8_context = nullcontext()
 
             else:
                 fp8_context = nullcontext()
@@ -1543,18 +1597,19 @@ class ParallelTransformer(MegatronModule):
                         # Cache FP8 weight and transpose at (1) the first micro-batch in each global-batch
                         # in training, (2) the first micro-batch in each validation and test routine.
                         # The caching happens in TransformerEngine when passing `is_first_microbatch=True`.
-                        is_first_microbatch = (self.is_first_train_microbatch and self.training) or (
-                            self.is_prev_microbatch_training and not self.training
-                        )
+                        #is_first_microbatch = (self.is_first_train_microbatch and self.training) or (
+                        #    self.is_prev_microbatch_training and not self.training
+                        #)
+                        is_first_microbatch = None
                         if self.transformer_engine:
                             hidden_states = layer(
                                 hidden_states,
-                                attention_mask,
-                                encoder_output=encoder_output,
-                                enc_dec_attn_mask=enc_dec_attn_mask,
-                                inference_params=self.inference_params,
-                                is_first_microbatch=is_first_microbatch,
-                                checkpoint_core_attention=checkpoint_core_attention,
+                                #attention_mask,
+                                #encoder_output=encoder_output,
+                                #enc_dec_attn_mask=enc_dec_attn_mask,
+                                #inference_params=self.inference_params,
+                                #is_first_microbatch=is_first_microbatch,
+                                #checkpoint_core_attention=checkpoint_core_attention,
                             )
                         else:
                             hidden_states = layer(
