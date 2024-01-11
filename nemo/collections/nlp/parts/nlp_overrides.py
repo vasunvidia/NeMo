@@ -205,7 +205,12 @@ class NLPDDPStrategy(DDPStrategy):
             hasattr(self.model, 'with_distributed_adam') and self.model.with_distributed_adam
         ):
             # do not use DDP if using megatron amp O2 or distributed optimizer
-            self._model = _LightningModuleWrapperBase(self.model)
+            print ('!!!DDP1 on side stream')
+            side_stream = torch.cuda.Stream()
+            side_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side_stream):
+                self._model = _LightningModuleWrapperBase(self.model)
+            torch.cuda.current_stream().wait_stream(side_stream)
         else:
             app_state = AppState()
 
