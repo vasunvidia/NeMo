@@ -132,7 +132,7 @@ class AutocastTransformerLayer(TransformerLayer):
         with torch.autocast(device_type="cuda", dtype=self.dtype):
             return super().forward(
                 hidden_states,
-                attention_mask,
+                attention_mask=attention_mask,
                 encoder_output=encoder_output,
                 enc_dec_attn_mask=enc_dec_attn_mask,
                 inference_params=inference_params,
@@ -174,6 +174,15 @@ class TETransformerLayerAutocast(AutocastTransformerLayer):
             device='cpu' if config.use_cpu_initialization else 'cuda',
         )
 
+    def reset_fp8_meta_tensors(self) -> None:
+        """Set TP group"""
+        # Deep iterate but skip self to avoid infinite recursion.
+        for index, child in enumerate(self.modules()):
+            if index == 0:
+                continue
+            if hasattr(child, "reset_fp8_meta_tensors"):
+                child.reset_fp8_meta_tensors()
+
     # Called by MCore's TransformerBlock.forward
     # megatron/core/transformer/transformer_block.py
     def forward(
@@ -197,7 +206,7 @@ class TETransformerLayerAutocast(AutocastTransformerLayer):
         self.is_first_microbatch = False
         context = None
 
-        return hidden_states, context
+        return hidden_states#, context
 
     def _get_layer_offset(self):
 
