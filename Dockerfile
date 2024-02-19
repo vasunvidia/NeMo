@@ -69,10 +69,10 @@ RUN git clone https://github.com/NVIDIA/Megatron-LM.git && \
   git checkout e122536b7645edcb7ebf099b5c92a443f7dbf8e7 && \
   pip install .
 
-# Performance optimizations for distributed optimizer: https://github.com/NVIDIA/apex/pull/1771
+# Apex bugfix for PyTorch 23.11 container: https://github.com/NVIDIA/apex/pull/1760
 RUN git clone https://github.com/NVIDIA/apex.git && \
   cd apex && \
-  git checkout b496d85fb88a801d8e680872a12822de310951fd && \
+  git checkout c07a4cf67102b9cd3f97d1ba36690f985bae4227 && \
   pip install -v --no-build-isolation --disable-pip-version-check --no-cache-dir --config-settings "--build-option=--cpp_ext --cuda_ext --fast_layer_norm --distributed_adam --deprecated_fused_adam" ./
 
 # Transformer Engine 1.2.0
