@@ -112,7 +112,7 @@ class AutocastTransformerLayer(TransformerLayer):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor,
+        attention_mask: torch.Tensor = None,
         encoder_output: Optional[torch.Tensor] = None,
         enc_dec_attn_mask: Optional[torch.Tensor] = None,
         inference_params: Optional[Any] = None,
@@ -188,7 +188,7 @@ class TETransformerLayerAutocast(AutocastTransformerLayer):
     def forward(
         self,
         hidden_states,
-        attention_mask,
+        attention_mask=None,
         context=None,
         context_mask=None,
         rotary_pos_emb=None,
