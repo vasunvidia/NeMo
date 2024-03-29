@@ -138,7 +138,6 @@ class AutocastTransformerLayer(TransformerLayer):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        skip_fp8_weight_update: torch.Tensor = None,
         attention_mask: torch.Tensor = None,
         encoder_output: Optional[torch.Tensor] = None,
         enc_dec_attn_mask: Optional[torch.Tensor] = None,
@@ -159,7 +158,6 @@ class AutocastTransformerLayer(TransformerLayer):
         with torch.autocast(device_type="cuda", dtype=self.dtype):
             return super().forward(
                 hidden_states,
-                skip_fp8_weight_update=skip_fp8_weight_update,
                 attention_mask=attention_mask,
                 encoder_output=encoder_output,
                 enc_dec_attn_mask=enc_dec_attn_mask,
@@ -229,7 +227,6 @@ class TETransformerLayerAutocast(AutocastTransformerLayer, BaseTransformerLayer)
     def forward(
         self,
         hidden_states,
-        skip_fp8_weight_update,
         is_first_microbatch=None,
         attention_mask=None,
         context=None,
@@ -240,7 +237,6 @@ class TETransformerLayerAutocast(AutocastTransformerLayer, BaseTransformerLayer)
     ):
         hidden_states = super().forward(
             hidden_states,
-            skip_fp8_weight_update=skip_fp8_weight_update,
             attention_mask=attention_mask,
             encoder_output=context,
             enc_dec_attn_mask=context_mask,
