@@ -247,7 +247,7 @@ class TETransformerLayerAutocast(AutocastTransformerLayer, BaseTransformerLayer)
         self.is_first_microbatch = False
         context = None
 
-        return hidden_states  # , context
+        return hidden_states
 
     def _get_layer_offset(self):
 
