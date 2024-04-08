@@ -97,7 +97,6 @@ class MegatronGPTSFTModel(NLPAdapterModelMixin, MegatronGPTModel):
 
         self._reset_activation_checkpointing_args()
         self.virtual_tokens = 0
-        self.init_global_step = 0
 
     def setup_metric(self, data_cfg):
         metric_name = "exact_string_match"
@@ -161,11 +160,6 @@ class MegatronGPTSFTModel(NLPAdapterModelMixin, MegatronGPTModel):
     def _metrics_require_string2category_map(self):
         return set(["f1", "accuracy", "average_precision"])
 
-    def maybe_setup_test(self):
-        if hasattr(self.cfg.data, 'test_ds') and self.cfg.data.test_ds.get('file_names', None) is not None:
-            self._test_dl = self.setup_eval_dataloader(self._test_ds, self.cfg.data.test_ds)
-        return
-
     def setup(self, stage=None):
         # NOTE: super().__init__ will try and setup train/val/test datasets, but we sidestep this using a if self._train_ds is not None condition
         # We then set things up for real only once setup() of this class is called.
@@ -188,7 +182,8 @@ class MegatronGPTSFTModel(NLPAdapterModelMixin, MegatronGPTModel):
             self.setup_training_dataloader()
         if hasattr(self, '_validation_ds'):
             self._validation_dl = self.setup_eval_dataloader(self._validation_ds, self.cfg.data.validation_ds)
-        self.maybe_setup_test()
+        if hasattr(self.cfg.data, 'test_ds') and self.cfg.data.test_ds.get('file_names', None) is not None:
+            self._test_dl = self.setup_eval_dataloader(self._test_ds, self.cfg.data.test_ds)
 
         # when using pipeline model parallel the final stage need to initialize word embeddings
         self.initialize_last_rank_embeddings()
@@ -383,15 +378,8 @@ class MegatronGPTSFTModel(NLPAdapterModelMixin, MegatronGPTModel):
             first_val_step=first_val_step,
         )
 
-        non_loss_tensors = {}
         # only the last stages of the pipeline return losses
         if losses_reduced_per_micro_batch:
-            for item in losses_reduced_per_micro_batch:
-                for k, v in item.items():
-                    if k != 'avg':
-                        av = non_loss_tensors.get(k, [])
-                        av.append(v)
-                        non_loss_tensors[k] = av
             if (not forward_only) or self.cfg.data.get('validation_drop_last', True):
                 # average loss across micro batches
                 loss_tensors_list = [loss_reduced['avg'] for loss_reduced in losses_reduced_per_micro_batch]
@@ -417,12 +405,7 @@ class MegatronGPTSFTModel(NLPAdapterModelMixin, MegatronGPTModel):
             else:
                 loss_mean = torch.tensor(0.0).cuda()
 
-        # if forward_only:
-        # return loss_mean
-        if non_loss_tensors:  # TODO: need a nicer way to do this via inheritance (@adithyare)
-            return loss_mean, non_loss_tensors
-        else:
-            return loss_mean
+        return loss_mean
 
     def validation_step(self, dataloader_iter):
         return self.inference_step(dataloader_iter, 'validation')
@@ -435,23 +418,6 @@ class MegatronGPTSFTModel(NLPAdapterModelMixin, MegatronGPTModel):
         data_cfg = self.cfg.data.validation_ds if mode == 'validation' else self.cfg.data.test_ds
         self._reconfigure_and_process_inference_batch(batch, data_cfg)
         # Meta data from dataset
-        outputs = self.inference_step_validation_call(batch, batch_idx, data_cfg, dataloader_idx)
-
-        if mode == 'validation':
-            if type(self.trainer.val_dataloaders) == list and len(self.trainer.val_dataloaders) > 1:
-                # super().validation_step appends just loss to self.validation_step_outputs, replace the last appended loss with the outputs dict
-                self.validation_step_outputs[dataloader_idx][-1] = outputs
-            else:
-                # super().validation_step appends just loss to self.validation_step_outputs, replace the last appended loss with the outputs dict
-                self.validation_step_outputs[-1] = outputs
-        else:
-            if type(self.trainer.test_dataloaders) == list and len(self.trainer.test_dataloaders) > 1:
-                self.test_step_outputs[dataloader_idx][-1] = outputs
-            else:
-                self.test_step_outputs[-1] = outputs
-        return outputs
-
-    def inference_step_validation_call(self, batch, batch_idx, data_cfg, dataloader_idx=0):
         metadata = batch.get('metadata', [{}] * len(batch['tokens']))
         # Pass dataloader_idx, as it's needed in val_step of GPTModel to append the loss correctly to self.val/test_step_outputs
         # in case of multi dataloaders
@@ -485,6 +451,19 @@ class MegatronGPTSFTModel(NLPAdapterModelMixin, MegatronGPTModel):
             'inputs': inputs_text,  # [str]
             'metadata': metadata,  # [dict]
         }
+
+        if mode == 'validation':
+            if type(self.trainer.val_dataloaders) == list and len(self.trainer.val_dataloaders) > 1:
+                # super().validation_step appends just loss to self.validation_step_outputs, replace the last appended loss with the outputs dict
+                self.validation_step_outputs[dataloader_idx][-1] = outputs
+            else:
+                # super().validation_step appends just loss to self.validation_step_outputs, replace the last appended loss with the outputs dict
+                self.validation_step_outputs[-1] = outputs
+        else:
+            if type(self.trainer.test_dataloaders) == list and len(self.trainer.test_dataloaders) > 1:
+                self.test_step_outputs[dataloader_idx][-1] = outputs
+            else:
+                self.test_step_outputs[-1] = outputs
         return outputs
 
     def gather_and_maybe_write_predictions(self, output, data_cfg, mode, averaged_metric, dataloader_idx=0):
@@ -569,7 +548,6 @@ class MegatronGPTSFTModel(NLPAdapterModelMixin, MegatronGPTModel):
         return deduplicated_outputs, total_size
 
     def inference_epoch_end(self, outputs, mode, data_cfg):
-        # TODO: this method should be modularized. It is too long and does too many things. (@adithyare)
         # Parent class will handle logging of the loss.
         if not outputs or not outputs[0]:
             return
@@ -599,11 +577,9 @@ class MegatronGPTSFTModel(NLPAdapterModelMixin, MegatronGPTModel):
             # we can only log on one rank if it is rank zero so we broadcast from last rank
             torch.distributed.broadcast(loss, get_last_rank())
 
-            self.log('val_loss', loss, prog_bar=True, rank_zero_only=True, batch_size=1)
+            if mode != 'test':
+                self.log('val_loss', loss, prog_bar=True, rank_zero_only=True, batch_size=1)
 
-            # Determine the key used to log the loss based on the user provided name of the dataset or the dataloader index.
-            loss_log_key = self._determine_log_key(data_cfg, dataloader_idx, "loss", mode)
-            self.log(loss_log_key, loss, batch_size=1)
             averaged_loss.append(loss)
             self.gather_and_maybe_write_predictions(output, data_cfg, mode, averaged_metric, dataloader_idx)
 
@@ -792,14 +768,6 @@ class MegatronGPTSFTModel(NLPAdapterModelMixin, MegatronGPTModel):
                     data_parallel_size=parallel_state.get_data_parallel_world_size(),
                 )
 
-    def maybe_build_test(self):
-        if hasattr(self.cfg.data, 'test_ds') and self.cfg.data.test_ds.get('file_names', None) is not None:
-            logging.info('Building GPT SFT test datasets.')
-            # Wrap this in a list since the general finetuning parent class supports multi-validation.
-            self._test_ds = self._build_dataset(self.cfg.data.test_ds, is_train=False)
-            logging.info(f'Length of test dataset: {len(self._test_ds[0])}')
-        return
-
     def build_train_valid_test_datasets(self, stage):
         if stage != 'test':
             logging.info('Building GPT SFT validation datasets.')
@@ -808,7 +776,11 @@ class MegatronGPTSFTModel(NLPAdapterModelMixin, MegatronGPTModel):
             logging.info(f'Length of val dataset: {len(self._validation_ds[0])}')
 
         if stage != 'validate':
-            self.maybe_build_test()
+            if hasattr(self.cfg.data, 'test_ds') and self.cfg.data.test_ds.get('file_names', None) is not None:
+                logging.info('Building GPT SFT test datasets.')
+                # Wrap this in a list since the general finetuning parent class supports multi-validation.
+                self._test_ds = self._build_dataset(self.cfg.data.test_ds, is_train=False)
+                logging.info(f'Length of test dataset: {len(self._test_ds[0])}')
 
         if stage == 'validate' or stage == 'test':
             return
