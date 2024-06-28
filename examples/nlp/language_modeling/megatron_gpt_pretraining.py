@@ -31,10 +31,17 @@ from pytorch_lightning import Callback
 from transformer_engine.common import recipe
 from transformer_engine.pytorch import make_graphed_callables
 
-from apex.transformer.pipeline_parallel.utils import get_num_microbatches
+from apex.transformer.pipeline_parallel.utils import get_num_microbatches as _get_num_microbatches
 torch._dynamo.config.suppress_errors = True
 
 mp.set_start_method("spawn", force=True)
+
+def get_num_microbatches():
+    pipeline_model_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
+    if pipeline_model_parallel_size > 1:
+        return _get_num_microbatches()
+    else: 
+        return 1
 
 class CudaGraphCallback(Callback):
     def __init__(self, cfg):
@@ -135,6 +142,7 @@ class CudaGraphCallback(Callback):
                 for b in range(get_num_microbatches()):
                     graph_input = (torch.ones((slen, micro_batch_size, cfg.hidden_size), dtype=torch.bfloat16, requires_grad=True, device='cuda'),)
                     sample_args.append(graph_input)
+
         graphs = make_graphed_callables(tuple(callables), tuple(sample_args), _order=schedule, allow_unused_input=True, fp8_enabled=cfg.fp8, fp8_recipe=fp8_recipe if cfg.fp8 else None, fp8_weight_caching=True)
 
         for m_no, model in enumerate(model_chunks):
