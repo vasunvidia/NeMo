@@ -332,7 +332,7 @@ class TETransformerLayerAutocast(AutocastTransformerLayer, BaseTransformerLayer)
 
             out = self.cudagraph_manager(self, args, kwargs)
         else:
-            out = super(MegatronModule, self).__call__(*args, **kwargs)
+            out = super().__call__(*args, **kwargs)
         return out
 
 
