@@ -1299,8 +1299,8 @@ class MegatronStep(Generic[ModelT, DataT]):
                 MegatronStep.train_graph.replay()
             else:
                 assert MegatronStep.train_graph is not None
-                if torch.distributed.get_rank() == 0:
-                    print ('CUDA graph capture replay')
+                #if torch.distributed.get_rank() == 0:
+                #    print ('CUDA graph replay')
                 MegatronStep.train_graph.replay()
             return MegatronStep.train_result
         else:
