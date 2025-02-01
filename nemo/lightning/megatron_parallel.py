@@ -48,7 +48,7 @@ from megatron.core.distributed import DistributedDataParallel as McoreDDP
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.optimizer import OptimizerConfig
 from megatron.core.transformer.transformer_config import TransformerConfig
-from transformer_engine.pytorch.distributed import get_all_rng_states, graph_safe_rng_available
+from megatron.core.tensor_parallel.random import get_all_rng_states, graph_safe_rng_available
 from torch import Tensor, nn
 from typing_extensions import override
 
@@ -232,6 +232,7 @@ class MegatronParallel(nn.ModuleList, Generic[ModelT]):
         num_microbatches: Optional[int] = None,
         step_i: Optional[int] = None,
         wrap_forward_step: bool = True,
+        capture_cuda_graph: bool = False,
     ) -> torch.Tensor:
         """The method performs the forward pass of the model.
 
@@ -280,6 +281,7 @@ class MegatronParallel(nn.ModuleList, Generic[ModelT]):
             seq_length=seq_length,
             step_i=step_i,
             data_step=_data_step,
+            capture_cuda_graph=capture_cuda_graph,
         )
         _forward_context["step"] = step
         step = self.callbacks.transform_event("on_megatron_step_start", step)
@@ -321,6 +323,7 @@ class MegatronParallel(nn.ModuleList, Generic[ModelT]):
         seq_length: Optional[int] = None,
         micro_batch_size: Optional[int] = None,
         num_microbatches: Optional[int] = None,
+        capture_cuda_graph: bool = False,
         **kwargs,
     ) -> STEP_OUTPUT:
         return self._step(
@@ -333,6 +336,7 @@ class MegatronParallel(nn.ModuleList, Generic[ModelT]):
             micro_batch_size=micro_batch_size,
             num_microbatches=num_microbatches,
             forward_only=False,
+            capture_cuda_graph=capture_cuda_graph,
             **kwargs,
         )
 
@@ -426,6 +430,7 @@ class MegatronParallel(nn.ModuleList, Generic[ModelT]):
         num_microbatches: Optional[int] = None,
         forward_only: bool = True,
         step_i: Optional[int] = None,
+        capture_cuda_graph: bool = False,
         **kwargs,
     ) -> STEP_OUTPUT:
         if not hasattr(self.module, f"{step_type}_step"):
@@ -445,6 +450,7 @@ class MegatronParallel(nn.ModuleList, Generic[ModelT]):
             num_microbatches=num_microbatches,
             forward_only=forward_only,
             step_i=step_i,
+            capture_cuda_graph=capture_cuda_graph,
             **kwargs,
         )
 
@@ -477,6 +483,7 @@ class MegatronParallel(nn.ModuleList, Generic[ModelT]):
 
             #batch = _data_step(dataloader_iter)
             batch = dataloader_iter.pop()
+            #import pdb; pdb.set_trace()
             step = context["step"]
 
             if isinstance(loss_reduction, _ModuleStepFunction):
@@ -567,7 +574,8 @@ class MegatronParallel(nn.ModuleList, Generic[ModelT]):
         if self.convert_module_fn:
             self.apply_convert_module_fn()
 
-        self.init_ddp()
+        with torch.cuda.stream(torch.cuda.Stream()):
+            self.init_ddp()
 
     def apply_convert_module_fn(self):
         for i in range(len(self)):
@@ -1097,6 +1105,7 @@ class MegatronStep(Generic[ModelT, DataT]):
     decoder_seq_length: Optional[int] = None
     data_step: Optional[int] = None
     train_graph: torch.cuda.CUDAGraph = None
+    capture_cuda_graph: bool = False
     train_result = None
     val_result = None
 
@@ -1112,6 +1121,7 @@ class MegatronStep(Generic[ModelT, DataT]):
         num_microbatches: Optional[int] = None,
         step_i: Optional[int] = None,
         data_step = None,
+        capture_cuda_graph: bool = False,
     ) -> "MegatronStep[ModelT, DataT]":
         """
         Creates a MegatronStep instance, inferring missing parameters if possible.
@@ -1145,6 +1155,7 @@ class MegatronStep(Generic[ModelT, DataT]):
             step_i=step_i,
             data_step=data_step,
             train_graph=MegatronStep.train_graph,
+            capture_cuda_graph=capture_cuda_graph,
         )
 
     def run_step(self, data_iterator, seq_length):
@@ -1166,6 +1177,33 @@ class MegatronStep(Generic[ModelT, DataT]):
             forward_only=self.forward_only,
             decoder_seq_length=self.decoder_seq_length,
         )
+#    def run_step(self, iterators, seq_length):
+#        data = []
+#        if not isinstance(self.model, list):
+#            models = [self.model]
+#        else:
+#            models = self.model
+#        for i in range(len(iterators)):
+#            if isinstance(self.data_step, _ModuleStepFunction):
+#                _data_step = self.data_step(models[i])
+#            else:
+#                _data_step = self.data_step
+#            data_list = []
+#            for j in range(self.num_microbatches):
+#                _data = _data_step(iterators[i])
+#                print (f'run_step model_chunk {i} microbatch {j} data {_data}')
+#                data_list.append(_data)
+#            data.append(data_list)
+#        return self.forward_backward_func(
+#            forward_step_func=self.forward_step_func,
+#            data_iterator=data,
+#            model=self.model,
+#            num_microbatches=self.num_microbatches,
+#            seq_length=seq_length,
+#            micro_batch_size=self.micro_batch_size,
+#            forward_only=self.forward_only,
+#            decoder_seq_length=self.decoder_seq_length,
+#        )
 
     def __call__(self) -> List[Any]:
         """
@@ -1200,10 +1238,24 @@ class MegatronStep(Generic[ModelT, DataT]):
         iter_data_list = iter(iter_data_list)
 
         if self.model.training:
+#        is_training = self.model.training if not isinstance(self.model, list) else self.model[0].training
+#        print (f'MegatronStep is_training {is_training}')
+#
+#        # data_iterator is a list with num_model_chunks number of iterators
+#        if not isinstance(data_iterator, list):
+#            data_iterator = [data_iterator]
+#        
+#        iterators = []
+#        for iterator in data_iterator:
+#            iter_data_list = []
+#            for _ in range(self.num_microbatches):
+#                iter_data_list.append(next(data_iterator[0]))
+#            iter_data_list = iter(iter_data_list)
+#            iterators.append(iter_data_list)
+#
+#        if is_training:
             assert self.step_i is not None
-            if self.step_i < 4:
-                MegatronStep.train_result = self.run_step (iter_data_list, seq_length)
-            elif self.step_i == 4:
+            if self.capture_cuda_graph:
                 # Capture CUDAgraph
                 capture_stream = torch.cuda.Stream()
                 MegatronStep.train_graph = torch.cuda.CUDAGraph()
@@ -1214,18 +1266,20 @@ class MegatronStep(Generic[ModelT, DataT]):
                 torch.cuda.synchronize()
                 torch.distributed.barrier()
                 if torch.distributed.get_rank() == 0:
-                    print ('Capturing CUDA graph')
+                    print ('    MegatronStep: Capturing CUDA graph')
                 with torch.cuda.graph(MegatronStep.train_graph, stream=capture_stream, capture_error_mode="global"):
                     MegatronStep.train_result = self.run_step (iter_data_list, seq_length)
                 torch.cuda.synchronize()
                 torch.distributed.barrier()
                 if torch.distributed.get_rank() == 0:
-                    print ('CUDA graph capture done')
-                MegatronStep.train_graph.replay()
+                    print ('    MegatronStep: CUDA graph capture done')
+            if MegatronStep.train_graph is None:
+                if torch.distributed.get_rank() == 0:
+                    print ('    MegatronStep: run_step')
+                MegatronStep.train_result = self.run_step (iter_data_list, seq_length)
             else:
-                assert MegatronStep.train_graph is not None
-                #if torch.distributed.get_rank() == 0:
-                #    print ('CUDA graph replay')
+                if torch.distributed.get_rank() == 0:
+                    print ('    MegatronStep: CUDA graph replay')
                 MegatronStep.train_graph.replay()
             return MegatronStep.train_result
         else:
@@ -1806,8 +1860,10 @@ def masked_token_loss_context_parallel(tensor: Tensor, mask: Tensor, num_valid_t
     loss_mask = mask.view(-1).float()
     if num_valid_tokens_in_ub is None:
         num_valid_tokens_in_ub = loss_mask.sum()
-    if num_valid_tokens_in_ub < 0.5:  # no valid tokens
-        num_valid_tokens_in_ub += 1.0
+    #if num_valid_tokens_in_ub < 0.5:  # no valid tokens
+    #    num_valid_tokens_in_ub += 1.0
+    z = num_valid_tokens_in_ub < 0.5  # no valid tokens
+    num_valid_tokens_in_ub += z
     loss = torch.sum(losses.view(-1) * loss_mask) / num_valid_tokens_in_ub  # sequence level nll
     torch.distributed.all_reduce(loss, group=parallel_state.get_context_parallel_group())
 
