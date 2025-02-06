@@ -53,7 +53,7 @@ from megatron.core.distributed import DistributedDataParallel as McoreDDP
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.optimizer import OptimizerConfig
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.tensor_parallel.random import get_all_rng_states, graph_safe_rng_available
+from megatron.core.tensor_parallel.random import get_all_rng_states
 from torch import Tensor, nn
 from typing_extensions import override
 
@@ -1307,9 +1307,8 @@ class MegatronStep(Generic[ModelT, DataT]):
                 capture_stream = torch.cuda.Stream()
                 MegatronStep.train_graph = torch.cuda.CUDAGraph()
                 # For cases with multiple active RNG states, e.g. TP.
-                if graph_safe_rng_available():
-                    for _, state in get_all_rng_states().items():
-                        MegatronStep.train_graph.register_generator_state(state)
+                for _, state in get_all_rng_states().items():
+                    MegatronStep.train_graph.register_generator_state(state)
                 torch.cuda.synchronize()
                 torch.distributed.barrier()
                 if torch.distributed.get_rank() == 0:
