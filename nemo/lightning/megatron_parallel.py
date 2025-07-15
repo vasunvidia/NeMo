@@ -54,7 +54,7 @@ from megatron.core.distributed import DistributedDataParallel as McoreDDP
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.optimizer import OptimizerConfig
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.training.full_cuda_graph import FullCGWrapper
+from megatron.training.full_cuda_graph import FullCudaGraphWrapper
 from torch import Tensor, nn
 from typing_extensions import override
 
@@ -1383,7 +1383,7 @@ class MegatronStep(Generic[ModelT, DataT]):
         from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
 
         if self.full_cuda_graph:
-            return FullCGWrapper(get_forward_backward_func())
+            return FullCudaGraphWrapper(get_forward_backward_func())
         return get_forward_backward_func()
 
     @property
